@@ -690,14 +690,23 @@ type encrypter struct {
 	err      error
 }
 
-// newEncrypter creates a new file handle encrypting on the fly
+// newEncrypter creates a new file handle encrypting on the fly, emitting the
+// file header (magic + nonce) before the encrypted blocks.
 func (c *Cipher) newEncrypter(in io.Reader, nonce *nonce) (*encrypter, error) {
+	return c.newEncrypterWithHeader(in, nonce, true)
+}
+
+// newEncrypterWithHeader creates a new file handle encrypting on the fly. If
+// withHeader is true the file header (magic + nonce) is emitted before the
+// encrypted blocks; otherwise just the encrypted blocks are emitted (used for
+// parts of a file that aren't the first - the header only appears once, at the
+// start of the file).
+func (c *Cipher) newEncrypterWithHeader(in io.Reader, nonce *nonce, withHeader bool) (*encrypter, error) {
 	fh := &encrypter{
 		in:      in,
 		c:       c,
 		buf:     c.getBlock(),
 		readBuf: c.getBlock(),
-		bufSize: fileHeaderSize,
 	}
 	// Initialise nonce
 	if nonce != nil {
@@ -708,10 +717,13 @@ func (c *Cipher) newEncrypter(in io.Reader, nonce *nonce) (*encrypter, error) {
 			return nil, err
 		}
 	}
-	// Copy magic into buffer
-	copy((*fh.buf)[:], fileMagicBytes)
-	// Copy nonce into buffer
-	copy((*fh.buf)[fileMagicSize:], fh.nonce[:])
+	if withHeader {
+		// Emit the header before the blocks: copy magic and nonce into the
+		// buffer and arrange for them to be read out first.
+		fh.bufSize = fileHeaderSize
+		copy((*fh.buf)[:], fileMagicBytes)
+		copy((*fh.buf)[fileMagicSize:], fh.nonce[:])
+	}
 	return fh, nil
 }
 
@@ -765,6 +777,116 @@ func (c *Cipher) encryptData(in io.Reader) (io.Reader, *encrypter, error) {
 		return nil, nil, err
 	}
 	return wrap(out), out, nil // and wrap the accounting back on
+}
+
+// newEncrypterAt creates an encrypter that encrypts plaintext as blocks
+// beginning at blockOffset, using initialNonce as the file's block-0 nonce.
+//
+// Because the per-block nonce is deterministic (initialNonce + blockIndex)
+// this produces exactly the ciphertext that a sequential whole-file encrypt
+// would have produced for those blocks - so independent parts can be
+// encrypted and concatenated. When withHeader is false the 32-byte file
+// header (magic + nonce) is suppressed, which is what every part after the
+// first one needs.
+func (c *Cipher) newEncrypterAt(in io.Reader, initialNonce nonce, blockOffset int64, withHeader bool) (*encrypter, error) {
+	n := initialNonce
+	n.add(uint64(blockOffset))
+	return c.newEncrypterWithHeader(in, &n, withHeader)
+}
+
+// partEncrypter is an io.ReadSeeker that encrypts a seekable plaintext
+// source for a single multipart part, beginning at blockOffset.
+//
+// It supports the Seek(0, SeekEnd)/Seek(0, SeekStart) pattern used by
+// backend ChunkWriters to size a part and to rewind on retry. Rewinding is
+// free because encryption is deterministic: the plaintext source is
+// re-seeked and the encrypter rebuilt, so no buffering of the encrypted
+// data is required.
+type partEncrypter struct {
+	c          *Cipher
+	src        io.ReadSeeker // plaintext source for this part
+	nonce      nonce         // the file's block-0 nonce
+	blockOff   int64         // index of the first block in this part
+	withHeader bool          // emit the file header (part 0 only)
+	enc        *encrypter    // current encrypter over src
+}
+
+// newPartEncrypter returns a partEncrypter positioned at the start.
+func (c *Cipher) newPartEncrypter(src io.ReadSeeker, initialNonce nonce, blockOffset int64, withHeader bool) (*partEncrypter, error) {
+	pe := &partEncrypter{
+		c:          c,
+		src:        src,
+		nonce:      initialNonce,
+		blockOff:   blockOffset,
+		withHeader: withHeader,
+	}
+	if err := pe.rewind(); err != nil {
+		return nil, err
+	}
+	return pe, nil
+}
+
+// rewind seeks the plaintext source back to the start and rebuilds the
+// encrypter, releasing the previous encrypter's pooled buffers.
+func (pe *partEncrypter) rewind() error {
+	if pe.enc != nil {
+		// Release pooled buffers if the encrypter didn't run to EOF.
+		_, _ = pe.enc.finish(io.EOF)
+		pe.enc = nil
+	}
+	if _, err := pe.src.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	enc, err := pe.c.newEncrypterAt(pe.src, pe.nonce, pe.blockOff, pe.withHeader)
+	if err != nil {
+		return err
+	}
+	pe.enc = enc
+	return nil
+}
+
+// Read implements io.Reader.
+func (pe *partEncrypter) Read(p []byte) (int, error) {
+	return pe.enc.Read(p)
+}
+
+// DelayAccounting forwards a backend's accounting delay to the plaintext
+// source. Backends that read a part more than once (e.g. to checksum it and
+// then upload it) call this so the extra reads aren't double counted; because
+// each re-read of the part re-reads the source once, the same delay applies to
+// the source. This implements pool.DelayAccountinger structurally.
+func (pe *partEncrypter) DelayAccounting(i int) {
+	if do, ok := pe.src.(interface{ DelayAccounting(int) }); ok {
+		do.DelayAccounting(i)
+	}
+}
+
+// Seek implements io.Seeker for the two patterns ChunkWriters use:
+// Seek(0, SeekEnd) to discover the encrypted size and Seek(0, SeekStart)
+// to rewind. Other seeks are not supported.
+func (pe *partEncrypter) Seek(offset int64, whence int) (int64, error) {
+	if offset != 0 {
+		return 0, errors.New("crypt: partEncrypter only supports seeking to start or end")
+	}
+	switch whence {
+	case io.SeekStart:
+		if err := pe.rewind(); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	case io.SeekEnd:
+		plainSize, err := pe.src.Seek(0, io.SeekEnd)
+		if err != nil {
+			return 0, err
+		}
+		encSize := pe.c.EncryptedSize(plainSize)
+		if !pe.withHeader {
+			encSize -= int64(fileHeaderSize)
+		}
+		return encSize, nil
+	default:
+		return 0, errors.New("crypt: partEncrypter unsupported seek")
+	}
 }
 
 // EncryptData encrypts the data stream

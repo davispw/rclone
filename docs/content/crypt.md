@@ -792,6 +792,60 @@ This uses a 32 byte (256 bit key) key derived from the user password.
 1049120 bytes total (a 0.05% overhead). This is the overhead for big
 files.
 
+### Multipart uploads
+
+When the backing remote supports chunked uploads (`OpenChunkWriter` -
+most cloud backends such as `s3`, `b2`, `azureblob`,
+`oracleobjectstorage`) or random-access writes (`OpenWriterAt` -
+`local`, `azurefiles`), `crypt` can encrypt and upload a file in
+multiple parts that are streamed straight through to the backing
+remote. This is used, for example, when serving an encrypted remote
+with [`rclone serve s3`](/commands/rclone_serve_s3/) and a client
+performs a multipart upload, and by multi-thread uploads. Memory use
+stays bounded by the parts in flight rather than the size of the whole
+file.
+
+This is possible because the per-chunk nonce is deterministic: the
+nonce for chunk *N* is the file's initial nonce incremented *N* times
+(see [Header](#header) above). So each part can be encrypted
+independently - using the nonce for the chunk at which it starts - and
+the encrypted parts concatenate into exactly the same file a single
+sequential encryption would have produced. Only the first part carries
+the 32 byte file header.
+
+For this to work each part must begin on a chunk boundary, which means:
+
+- every part except the last must be a whole number of 64 KiB chunks,
+  i.e. its size must be a multiple of 64 KiB (65536 bytes); and
+- the last part may be any size.
+
+All parts except the last must therefore be the **same size** and that
+size must be a multiple of 64 KiB. Multipart part sizes are almost
+always a multiple of 64 KiB already (for example the common 5/8/16 MiB
+part sizes all are), so this is satisfied automatically. If a part is
+not a multiple of 64 KiB, or the parts are not all the same size (so
+they overlap or leave a gap), the upload is rejected with an error - if
+you hit this, configure the client to use a uniform part/chunk size
+that is a multiple of 64 KiB (or disable multipart uploads on the
+client).
+
+Note that the usual end-to-end check that `crypt` performs on a normal
+upload - hashing the encrypted data and comparing it against the hash
+the backend reports - is **not** done for multipart uploads, because
+the file is never encrypted as a single stream. The backing remote's
+own per-part integrity checks (for example S3's per-part MD5) still
+apply.
+
+Parts that arrive before the part size is known (for example when a
+client uploads parts out of order or concurrently) are held in a pooled
+memory buffer until a second part determines the size. In the normal
+in-order case no buffering is needed; otherwise the amount buffered is
+bounded by the number of parts the client uploads concurrently (its
+upload concurrency), not by the size of the whole file. With
+[`--crypt-no-data-encryption`](#crypt-no-data-encryption) there are no
+chunks, so the part stream is passed straight through to the backing
+remote's chunked uploader unchanged.
+
 ### Name encryption
 
 File names are encrypted segment by segment - the path is broken up

@@ -297,6 +297,17 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 	// Enable ListP always
 	f.features.ListP = f.ListP
 
+	// Enable streaming multipart uploads when the underlying backend can
+	// accept positional writes. This is set after Mask because the
+	// underlying may expose only OpenWriterAt, not OpenChunkWriter, and we
+	// can drive either from our OpenChunkWriter implementation. With data
+	// encryption off we pass bytes through untouched, so we can only
+	// delegate to a real underlying OpenChunkWriter.
+	uf := wrappedFs.Features()
+	if uf.OpenChunkWriter != nil || (uf.OpenWriterAt != nil && !f.opt.NoDataEncryption) {
+		f.features.OpenChunkWriter = f.OpenChunkWriter
+	}
+
 	return f, err
 }
 
@@ -1313,6 +1324,7 @@ var (
 	_ fs.Commander       = (*Fs)(nil)
 	_ fs.PutUncheckeder  = (*Fs)(nil)
 	_ fs.PutStreamer     = (*Fs)(nil)
+	_ fs.OpenChunkWriter = (*Fs)(nil)
 	_ fs.CleanUpper      = (*Fs)(nil)
 	_ fs.UnWrapper       = (*Fs)(nil)
 	_ fs.ListRer         = (*Fs)(nil)

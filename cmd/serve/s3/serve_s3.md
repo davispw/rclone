@@ -97,6 +97,13 @@ backends including `s3`, `b2`, `azureblob`, `oracleobjectstorage`,
 backend without buffering the whole file in memory. Memory use stays
 bounded by the size of the parts in flight.
 
+This also works through `crypt` when its underlying remote is one of
+the above. `crypt` encrypts each part on the fly, so streaming requires
+that every multipart part except the last is a multiple of 64 KiB (the
+crypt block size). Clients normally use part sizes that are a multiple
+of 64 KiB (for example 5/8/16 MiB), so this is satisfied automatically;
+a client using some other part size will have the upload rejected.
+
 For backends that support neither, multipart parts are still buffered
 in memory (the legacy behaviour). To avoid that case, the example
 config above sets `use_multipart_uploads = false` so the client

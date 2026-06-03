@@ -1640,3 +1640,62 @@ func TestKey(t *testing.T) {
 	assert.Equal(t, [32]byte{}, c.nameKey)
 	assert.Equal(t, [16]byte{}, c.nameTweak)
 }
+
+// TestNewEncrypterAt checks that encrypting independent block-aligned parts
+// with newEncrypterAt (only the first carrying the header) and concatenating
+// them produces exactly the same ciphertext as a sequential whole-file
+// encrypt, and that it decrypts back to the original.
+func TestNewEncrypterAt(t *testing.T) {
+	c, err := newCipher(NameEncryptionStandard, "", "", true, nil)
+	require.NoError(t, err)
+
+	// 3 full blocks plus a partial last block
+	const plainLen = 3*blockDataSize + 123
+	plain := make([]byte, plainLen)
+	for i := range plain {
+		plain[i] = byte(i % 251)
+	}
+
+	// fixed file nonce so the two encrypts are comparable
+	var fileNonce nonce
+	for i := range fileNonce {
+		fileNonce[i] = byte(i + 1)
+	}
+
+	// reference: sequential whole-file encrypt with this nonce
+	seqEnc, err := c.newEncrypter(bytes.NewReader(plain), &fileNonce)
+	require.NoError(t, err)
+	reference, err := io.ReadAll(seqEnc)
+	require.NoError(t, err)
+
+	encryptPart := func(start, end int64, withHeader bool) []byte {
+		require.Zero(t, start%blockDataSize, "part must start on a block boundary")
+		enc, err := c.newEncrypterAt(bytes.NewReader(plain[start:end]), fileNonce, start/blockDataSize, withHeader)
+		require.NoError(t, err)
+		b, err := io.ReadAll(enc)
+		require.NoError(t, err)
+		return b
+	}
+
+	for _, partBlocks := range []int64{1, 2, 3} {
+		partSize := partBlocks * blockDataSize
+		var got []byte
+		first := true
+		for start := int64(0); start < plainLen; start += partSize {
+			end := start + partSize
+			if end > plainLen {
+				end = plainLen
+			}
+			got = append(got, encryptPart(start, end, first)...)
+			first = false
+		}
+		assert.Equalf(t, reference, got, "partBlocks=%d: concatenated parts should equal sequential ciphertext", partBlocks)
+
+		// ... and it must decrypt back to the original plaintext
+		dec, err := c.newDecrypter(io.NopCloser(bytes.NewReader(got)))
+		require.NoError(t, err)
+		back, err := io.ReadAll(dec)
+		require.NoError(t, err)
+		assert.Equal(t, plain, back)
+	}
+}
