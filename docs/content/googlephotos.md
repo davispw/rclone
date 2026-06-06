@@ -345,6 +345,24 @@ Properties:
 - Type:        bool
 - Default:     false
 
+#### --gphotos-trash-album-name
+
+Name of the album to use as a trash bin for deleted and overwritten files.
+
+The Google Photos API does not support deleting media permanently.
+Instead rclone moves removed items into this album so they can be
+reviewed and deleted manually from the Google Photos UI.
+
+Set this to an empty string to disable the trash workaround (removed
+items will not be added to any album, but will remain in your library).
+
+Properties:
+
+- Config:      trash_album_name
+- Env Var:     RCLONE_GPHOTOS_TRASH_ALBUM_NAME
+- Type:        string
+- Default:     "rclone_Trash"
+
 #### --gphotos-read-size
 
 Set to read the size of media items.
@@ -643,9 +661,13 @@ The Google Photos Library API does not allow media items to be permanently delet
 
 To work around this limitation and keep your active albums clean:
 * Rclone implements a "Trash Album" workaround for write operations (`Remove` and `Update`).
-* When a file is deleted or overwritten, rclone automatically discovers or creates an album named `"rclone_Trash"`.
-* The old media item is added to `"rclone_Trash"` and removed from the active album.
-* You can periodically review and permanently delete or empty items from the `"rclone_Trash"` album via the Google Photos web interface.
+* When a file is deleted or overwritten, rclone automatically discovers or creates an album named `"rclone_Trash"` (configurable via `--gphotos-trash-album-name`).
+* The old media item is added to the trash album and removed from the active album.
+* You can periodically review and permanently delete or empty items from the trash album via the Google Photos web interface.
+* To customize the trash album name, set `--gphotos-trash-album-name=<name>`.
+* To disable the trash workaround entirely (items will remain in your library but be removed from the album), set `--gphotos-trash-album-name=""`.
+
+**WARNING:** Google Photos deduplicates identical images globally across your library. If an image was uploaded to multiple albums, it exists as a single deduplicated media item. Therefore, if you empty the `rclone_Trash` album from the Google Photos Web UI, **it will permanently delete those items from the entire library**, inadvertently removing them from any other albums they belong to. Because the Google Photos API does not allow rclone to query which other albums a photo belongs to, you must exercise caution when manually emptying the trash if you mirror identical images across multiple albums.
 
 Rclone cannot delete files anywhere except under `album`.
 
