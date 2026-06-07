@@ -133,8 +133,44 @@ func (o *Object) updateHashes(ctx context.Context) error {
 
 // Update the object with the given data, time and size.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	_ = o.f.pruneHash(src.Remote())
-	return o.Object.Update(ctx, in, src, options...)
+	var (
+		common hash.Set
+		rehash bool
+		hashes hashMap
+	)
+	f := o.f
+	if fsrc := src.Fs(); fsrc != nil {
+		common = fsrc.Hashes().Overlap(f.keepHashes)
+		rehash = fsrc.Features().SlowHash || common != f.keepHashes
+	}
+
+	// Only calculate/cache the hash in-flight if the underlying remote
+	// does not support hashes natively (like Google Photos).
+	underlyingSupportsHashes := o.Object.Fs().Hashes().Count() != 0
+
+	wrapIn := in
+	if !underlyingSupportsHashes && rehash {
+		r, err := f.newHashingReader(ctx, in, func(sums hashMap) {
+			hashes = sums
+		})
+		if err == nil {
+			wrapIn = r
+		} else {
+			rehash = false
+		}
+	}
+
+	_ = f.pruneHash(src.Remote())
+	err := o.Object.Update(ctx, wrapIn, src, options...)
+	if err != nil {
+		return err
+	}
+
+	// Cache the hash only if we calculated it in-flight
+	if !underlyingSupportsHashes && len(hashes) > 0 {
+		_ = o.putHashes(ctx, hashes)
+	}
+	return nil
 }
 
 // Remove an object.

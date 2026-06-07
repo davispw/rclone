@@ -649,6 +649,42 @@ Rclone cannot delete files anywhere except under `album`.
 
 The Google Photos API does not support deleting albums - see [bug #135714733](https://issuetracker.google.com/issues/135714733).
 
+## Using the Hasher Backend Overlay for Checksum Sync
+
+To overcome the eventual consistency issues, lack of native MD5/checksums, and lack of modification times in Google Photos, you can wrap your googlephotos remote with the `hasher` backend.
+
+This overlay calculates checksums on-the-fly during upload, caches them in a local database (BoltDB), and uses them for transfer verification and future sync checks.
+
+### Configuration
+
+Add the following to your `rclone.conf` file:
+
+```ini
+[gphotos_cache]
+type = hasher
+remote = gphotos:
+hashes = md5
+max_age = off
+```
+
+*(Note: Replace `gphotos:` with your actual Google Photos remote name if it differs.)*
+
+### How to Sync
+
+With the hasher overlay configured, you can perform syncs using the following command structure:
+
+```bash
+rclone sync /path/to/local gphotos_cache:album/MyAlbum \
+  --gphotos-read-exif-description \
+  --gphotos-batch-mode sync
+```
+
+### Explanation of Behavior and Flags
+
+* **`--ignore-checksum` is NOT needed**: Since the hasher overlay caches the computed hash in-flight during the upload, the post-transfer check will immediately succeed against the local cache, avoiding eventual consistency errors from the Google Photos API.
+* **`--checksum` is NOT needed**: By default, rclone compares size and modification time. Since Google Photos does not support modification times, rclone automatically falls back to comparing hashes when modtime is unsupported (provided both sides support a common hash, which `hasher` provides). Therefore, hash-based comparison is now effectively the default behavior when using the hasher overlay.
+* **`--gphotos-batch-mode sync` (or `batch_mode = sync` in config) is REQUIRED**: This ensures that the Google Photos API commits the upload before returning. Without this, the file may be added as a zero-size placeholder initially, causing the hasher backend to cache the hash under the wrong file size.
+
 ## Making your own client_id
 
 When you use rclone with Google photos in its default configuration you
