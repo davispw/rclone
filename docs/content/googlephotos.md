@@ -289,6 +289,17 @@ Properties:
 - Type:        bool
 - Default:     false
 
+#### --gphotos-read-exif-description
+
+Read EXIF/IPTC/XMP metadata from the file on upload and set it as the Google Photos description.
+
+Properties:
+
+- Config:      read_exif_description
+- Env Var:     RCLONE_GPHOTOS_READ_EXIF_DESCRIPTION
+- Type:        bool
+- Default:     false
+
 ### Advanced options
 
 Here are the Advanced options specific to google photos (Google Photos).
@@ -447,6 +458,17 @@ Properties:
 - Env Var:     RCLONE_GPHOTOS_PROXY
 - Type:        string
 - Required:    false
+
+#### --gphotos-exif-description-fields
+
+EXIF/IPTC/XMP fields to search for description metadata, in priority order.
+
+Properties:
+
+- Config:      exif_description_fields
+- Env Var:     RCLONE_GPHOTOS_EXIF_DESCRIPTION_FIELDS
+- Type:        string
+- Default:     "Description,Caption-Abstract,ImageDescription,Title,ObjectName"
 
 #### --gphotos-encoding
 
@@ -622,6 +644,8 @@ if you uploaded an image to `upload` then uploaded the same image to
 what it was uploaded with initially, not what you uploaded it with to
 `album`.  In practise this shouldn't cause too many problems.
 
+Because deduplication ignores new metadata, **you cannot update an existing photo's EXIF description** by re-uploading identical file bytes (e.g. by using `--ignore-times`). The EXIF descriptions (enabled via `--gphotos-read-exif-description`) are only applied when a *new* media item is created. To update a description on Google Photos, you must modify the EXIF tags inside the local file (which changes the file bytes and MD5 hash, triggering a successful overwrite of the old item) or manually edit it in the Google Photos web interface.
+
 ### Modification times
 
 The date shown of media in Google Photos is the creation date as
@@ -674,6 +698,42 @@ Rclone cannot delete files anywhere except under `album`.
 ### Deleting albums
 
 The Google Photos API does not support deleting albums - see [bug #135714733](https://issuetracker.google.com/issues/135714733).
+
+## Using the Hasher Backend Overlay for Checksum Sync
+
+To overcome the eventual consistency issues, lack of native MD5/checksums, and lack of modification times in Google Photos, you can wrap your googlephotos remote with the `hasher` backend.
+
+This overlay calculates checksums on-the-fly during upload, caches them in a local database (BoltDB), and uses them for transfer verification and future sync checks.
+
+### Configuration
+
+Add the following to your `rclone.conf` file:
+
+```ini
+[gphotos_cache]
+type = hasher
+remote = gphotos:
+hashes = md5
+max_age = off
+```
+
+*(Note: Replace `gphotos:` with your actual Google Photos remote name if it differs.)*
+
+### How to Sync
+
+With the hasher overlay configured, you can perform syncs using the following command structure:
+
+```bash
+rclone sync /path/to/local gphotos_cache:album/MyAlbum \
+  --gphotos-read-exif-description \
+  --gphotos-batch-mode sync
+```
+
+### Explanation of Behavior and Flags
+
+* **`--ignore-checksum` is NOT needed**: Since the hasher overlay caches the computed hash in-flight during the upload, the post-transfer check will immediately succeed against the local cache, avoiding eventual consistency errors from the Google Photos API.
+* **`--checksum` is NOT needed**: By default, rclone compares size and modification time. Since Google Photos does not support modification times, rclone automatically falls back to comparing hashes when modtime is unsupported (provided both sides support a common hash, which `hasher` provides). Therefore, hash-based comparison is now effectively the default behavior when using the hasher overlay.
+* **`--gphotos-batch-mode sync` (or `batch_mode = sync` in config) is REQUIRED**: This ensures that the Google Photos API commits the upload before returning. Without this, the file may be added as a zero-size placeholder initially, causing the hasher backend to cache the hash under the wrong file size.
 
 ## Making your own client_id
 

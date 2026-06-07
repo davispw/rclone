@@ -40,11 +40,15 @@ func (f *Fs) getRawHash(ctx context.Context, hashType hash.Type, remote, fp stri
 }
 
 // put new hashes for an object
-func (o *Object) putHashes(ctx context.Context, rawHashes hashMap) error {
+func (o *Object) putHashes(ctx context.Context, rawHashes hashMap, expectedSize ...int64) error {
 	if o.f.opt.MaxAge <= 0 {
 		return nil
 	}
-	fp := o.fingerprint(ctx)
+	size := o.Object.Size()
+	if len(expectedSize) > 0 {
+		size = expectedSize[0]
+	}
+	fp := o.fingerprintWithSize(ctx, size)
 	if fp == "" {
 		return nil
 	}
@@ -133,8 +137,44 @@ func (o *Object) updateHashes(ctx context.Context) error {
 
 // Update the object with the given data, time and size.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	_ = o.f.pruneHash(src.Remote())
-	return o.Object.Update(ctx, in, src, options...)
+	var (
+		common hash.Set
+		rehash bool
+		hashes hashMap
+	)
+	f := o.f
+	if fsrc := src.Fs(); fsrc != nil {
+		common = fsrc.Hashes().Overlap(f.keepHashes)
+		rehash = fsrc.Features().SlowHash || common != f.keepHashes
+	}
+
+	// Only calculate/cache the hash in-flight if the underlying remote
+	// does not support hashes natively (like Google Photos).
+	underlyingSupportsHashes := o.Object.Fs().Hashes().Count() != 0
+
+	wrapIn := in
+	if !underlyingSupportsHashes && rehash {
+		r, err := f.newHashingReader(ctx, in, func(sums hashMap) {
+			hashes = sums
+		})
+		if err == nil {
+			wrapIn = r
+		} else {
+			rehash = false
+		}
+	}
+
+	_ = f.pruneHash(src.Remote())
+	err := o.Object.Update(ctx, wrapIn, src, options...)
+	if err != nil {
+		return err
+	}
+
+	// Cache the hash only if we calculated it in-flight
+	if !underlyingSupportsHashes && len(hashes) > 0 {
+		_ = o.putHashes(ctx, hashes, src.Size())
+	}
+	return nil
 }
 
 // Remove an object.
@@ -230,7 +270,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		}
 	}
 	if len(hashes) > 0 {
-		err := o.(*Object).putHashes(ctx, hashes)
+		err := o.(*Object).putHashes(ctx, hashes, src.Size())
 		fs.Debugf(o, "Applied %d source hashes, err: %v", len(hashes), err)
 	}
 	return o, err
@@ -291,7 +331,10 @@ func (r *hashingReader) Close() error {
 // while `fs.Fingerprint` would select a hash _produced by hasher_
 // creating unresolvable fingerprint loop.
 func (o *Object) fingerprint(ctx context.Context) string {
-	size := o.Object.Size()
+	return o.fingerprintWithSize(ctx, o.Object.Size())
+}
+
+func (o *Object) fingerprintWithSize(ctx context.Context, size int64) string {
 	timeStr := "-"
 	if o.f.fpTime {
 		timeStr = o.Object.ModTime(ctx).UTC().Format(timeFormat)

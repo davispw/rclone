@@ -161,7 +161,7 @@ func (op *kvGet) Do(ctx context.Context, b kv.Bucket) error {
 	if err := r.decode(op.key, data); err != nil {
 		return errors.New("invalid record")
 	}
-	if !(r.Fp == anyFingerprint || op.fp == anyFingerprint || r.Fp == op.fp) {
+	if !(r.Fp == anyFingerprint || op.fp == anyFingerprint || r.Fp == op.fp || strings.HasPrefix(op.fp, "-1,") || strings.HasPrefix(r.Fp, "-1,")) {
 		return errors.New("fingerprint changed")
 	}
 	if time.Since(r.Created) > op.age {
